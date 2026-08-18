@@ -4,6 +4,7 @@ set -e
 
 # Parse command line arguments
 CONFIG="olmocr/train/configs/qwen25_vl_b100_x1_default.yaml"
+DATASET="s3://ai2-oe-data/jakep/olmocr/olmOCR-mix-1025"
 SKIP_DOCKER_BUILD=false
 PREEMPTIBLE=false
 
@@ -11,6 +12,11 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
             CONFIG="$2"
+            shift 2
+            ;;
+        --dataset)
+            # Strip trailing slashes from dataset path
+            DATASET="${2%/}"
             shift 2
             ;;
         --skip-docker-build)
@@ -23,13 +29,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--config CONFIG_PATH] [--skip-docker-build] [--preemptible]"
+            echo "Usage: $0 [--config CONFIG_PATH] [--dataset DATASET_PATH] [--skip-docker-build] [--preemptible]"
             exit 1
             ;;
     esac
 done
 
 echo "Using config: $CONFIG"
+echo "Using dataset: $DATASET"
 
 # Use conda environment Python if available, otherwise use system Python
 if [ -n "$CONDA_PREFIX" ]; then
@@ -79,24 +86,28 @@ cat << 'EOF' > /tmp/run_training_experiment.py
 import sys
 from beaker import Beaker, ExperimentSpec, TaskSpec, TaskContext, ResultSpec, TaskResources, ImageSource, Priority, Constraints, EnvVar, DataMount
 
-# Get image tag, beaker user, git branch, git hash, config, and preemptible from command line
+# Get image tag, beaker user, git branch, git hash, config, dataset, and preemptible from command line
 image_tag = sys.argv[1]
 beaker_user = sys.argv[2]
 git_branch = sys.argv[3]
 git_hash = sys.argv[4]
 config = sys.argv[5]
-preemptible = sys.argv[6] == "true"
+dataset = sys.argv[6]
+preemptible = sys.argv[7] == "true"
 
 # Initialize Beaker client
 b = Beaker.from_env(default_workspace="ai2/olmocr")
 
 # Build the training command
+# Extract the dataset name from the S3 path for the local directory
+dataset_name = dataset.rstrip('/').split('/')[-1]
 commands = [
     "pip install .[train]",
-    "pip install transformers==4.52.4",
-    "pip install flash-attn==2.8.0.post2 --no-build-isolation",
+    "pip install transformers==4.57.1",
+    "pip install flash-attn --no-build-isolation",
     "pip install s5cmd",
-    "s5cmd sync s3://ai2-oe-data/jakep/olmocr/olmOCR-mix-0225/preprocessed_v0_2_3/* /data/olmOCR-mix-0225/",
+    f"s5cmd sync {dataset}/processed_* /data/{dataset_name}/",
+    "s5cmd sync s3://ai2-oe-data/jakep/olmocr/qwen2.5-vl-7b-olmocrv4_1epoch_promptv4_mix1025_more_rotation-8372/* /data/models/qwen2.5-vl-7b-olmocrv4_1epoch_promptv4_mix1025_more_rotation-8372",
     f"python -m olmocr.train.train --config {config}"
 ]
 
@@ -127,7 +138,6 @@ task_spec = TaskSpec(
         EnvVar(name="WANDB_API_KEY", secret="JAKE_WANDB_API_KEY")
     ],
     datasets=[
-        DataMount.new(mount_path="/weka/oe-data-default", weka="oe-data-default"),
         DataMount.new(mount_path="/weka/oe-training-default", weka="oe-training-default"),
     ]
 )
@@ -147,7 +157,7 @@ EOF
 
 # Run the Python script to create the experiment
 echo "Creating Beaker experiment..."
-$PYTHON /tmp/run_training_experiment.py $IMAGE_TAG $BEAKER_USER $GIT_BRANCH $GIT_HASH "$CONFIG" $PREEMPTIBLE
+$PYTHON /tmp/run_training_experiment.py $IMAGE_TAG $BEAKER_USER $GIT_BRANCH $GIT_HASH "$CONFIG" "$DATASET" $PREEMPTIBLE
 
 # Clean up temporary file
 rm /tmp/run_training_experiment.py

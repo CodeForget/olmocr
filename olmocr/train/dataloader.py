@@ -1,10 +1,13 @@
+import argparse
 import base64
 import json
 import logging
 import re
+import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, replace
+from html.parser import HTMLParser
 from io import BytesIO
 from os import PathLike
 from pathlib import Path
@@ -14,15 +17,10 @@ from typing import (
     List,
     Optional,
     Tuple,
-    Type,
-    TypeAlias,
-    Union,
-    get_args,
-    get_origin,
 )
 
 import numpy as np
-import yaml
+import torch
 from PIL import Image
 from pypdf import PdfReader
 from torch.utils.data import Dataset
@@ -30,10 +28,12 @@ from tqdm import tqdm
 
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts.anchor import get_anchor_text
-from olmocr.prompts.prompts import PageResponse, build_finetuning_prompt
-
-# Type alias for samples
-Sample: TypeAlias = Dict[str, Any]
+from olmocr.prompts.prompts import (
+    PageResponse,
+    build_finetuning_prompt,
+    build_no_anchoring_v4_yaml_prompt,
+)
+from olmocr.train.front_matter import FrontMatterParser, Sample
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -179,102 +179,7 @@ class BaseMarkdownPDFDataset(Dataset):
         return sample
 
 
-@dataclass(frozen=True, slots=True)
-class FrontMatterParser(PipelineStep):
-    """Pipeline step that parses YAML front matter from markdown content."""
-
-    front_matter_class: Optional[Type] = None
-
-    def _is_optional_str(self, field_type: Type) -> bool:
-        """Check if a type is Optional[str]."""
-        origin = get_origin(field_type)
-        args = get_args(field_type)
-        return origin is Union and type(None) in args and str in args
-
-    def _extract_front_matter_and_text(self, markdown_content: str) -> tuple[Dict[str, Any], str]:
-        """Extract YAML front matter and text from markdown content."""
-        if markdown_content.startswith("---\n"):
-            try:
-                # Find the closing --- delimiter
-                end_index = markdown_content.find("\n---", 4)
-                if end_index != -1:
-                    front_matter_str = markdown_content[4:end_index]
-                    text = markdown_content[end_index + 4 :].strip()
-
-                    # Parse YAML
-                    front_matter = yaml.safe_load(front_matter_str) or {}
-                    return front_matter, text
-            except yaml.YAMLError as e:
-                logger.warning(f"Failed to parse YAML front matter: {e}")
-
-        return {}, markdown_content.strip()
-
-    def _parse_front_matter(self, front_matter_dict: Dict[str, Any], text: str) -> Any:
-        """Parse front matter dictionary into dataclass instance if front_matter_class is specified."""
-        if not self.front_matter_class:
-            return front_matter_dict
-
-        # Get field names and types from the dataclass
-        field_info = {f.name: f.type for f in fields(self.front_matter_class)}
-
-        # Validate and convert values
-        kwargs = {}
-        for field_name, field_type in field_info.items():
-            # Special handling for natural_text field in PageResponse
-            if field_name == "natural_text" and self.front_matter_class == PageResponse:
-                kwargs[field_name] = text if text else None
-                continue
-
-            if field_name not in front_matter_dict:
-                raise ValueError(f"Missing required field '{field_name}' in front matter")
-
-            value = front_matter_dict[field_name]
-
-            # Handle type conversions
-            if field_type is int and isinstance(value, str):
-                kwargs[field_name] = int(value)
-            elif field_type is bool and isinstance(value, str):
-                kwargs[field_name] = value.lower() == "true"
-            elif self._is_optional_str(field_type):
-                # Handle boolean values that YAML might produce (e.g., 'no' -> False)
-                if isinstance(value, bool):
-                    kwargs[field_name] = None
-                elif isinstance(value, str):
-                    kwargs[field_name] = value if value else None
-                else:
-                    kwargs[field_name] = None if not value else value
-            else:
-                kwargs[field_name] = value
-
-        # Check for extra fields (excluding natural_text if it's PageResponse)
-        expected_fields = set(field_info.keys())
-        if self.front_matter_class == PageResponse:
-            expected_fields.discard("natural_text")
-        extra_fields = set(front_matter_dict.keys()) - expected_fields
-        if extra_fields:
-            raise ValueError(f"Unexpected fields in front matter: {extra_fields}")
-
-        return self.front_matter_class(**kwargs)
-
-    def __call__(self, sample: Sample) -> Sample:
-        """Parse front matter from markdown content."""
-        # Read markdown content if not already loaded
-        if "markdown_content" not in sample:
-            sample["markdown_content"] = sample["markdown_path"].read_text(encoding="utf-8")
-
-        # Extract and parse front matter
-        front_matter, text = self._extract_front_matter_and_text(sample["markdown_content"])
-
-        # Parse front matter to dataclass if specified
-        try:
-            page_data = self._parse_front_matter(front_matter, text)
-        except Exception as e:
-            raise ValueError(f"Error parsing front matter for {sample['markdown_path']}: {e}")
-
-        # Only add page_data field
-        sample["page_data"] = page_data
-
-        return sample
+# FrontMatterParser is imported from olmocr.train.front_matter
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,11 +241,7 @@ class NewYamlFinetuningPromptWithNoAnchoring(PipelineStep):
     """Applies the standard fine tuning prompt"""
 
     def __call__(self, sample: Sample) -> Sample:
-        sample["instruction_prompt"] = (
-            f"Attached is one page of a document that you must process. "
-            f"Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown.\n"
-            f"Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
-        )
+        sample["instruction_prompt"] = build_no_anchoring_v4_yaml_prompt()
         return sample
 
 
@@ -352,8 +253,7 @@ class FrontMatterOutputFormat(PipelineStep):
         page_data = sample["page_data"]
         assert type(page_data) is PageResponse
 
-        sample["response"] = (
-            f"""---
+        sample["response"] = f"""---
 primary_language: {page_data.primary_language}
 is_rotation_valid: {page_data.is_rotation_valid}
 rotation_correction: {page_data.rotation_correction}
@@ -362,7 +262,6 @@ is_diagram: {page_data.is_diagram}
 ---
 {page_data.natural_text if page_data.natural_text is not None and len(page_data.natural_text.strip()) > 0 else ""}
 """.strip()
-        )
 
         return sample
 
@@ -419,8 +318,6 @@ class LatexBracketNormalizer(PipelineStep):
 
         # Update the page_data with normalized text
         # Since PageResponse is frozen, we need to create a new instance
-        from olmocr.prompts.prompts import PageResponse
-
         new_page_data = PageResponse(
             primary_language=page_data.primary_language,
             is_rotation_valid=page_data.is_rotation_valid,
@@ -482,8 +379,6 @@ class RotationAugmentation(PipelineStep):
         else:  # 270
             correction = 90
 
-        from olmocr.prompts.prompts import PageResponse
-
         new_page_data = PageResponse(
             primary_language=page_data.primary_language,
             is_rotation_valid=False,  # Mark as invalid since we rotated it
@@ -516,6 +411,670 @@ class FilterOutRotatedDocuments(PipelineStep):
         # Filter out if rotation is invalid or rotation correction is not 0
         if page_data.is_rotation_valid is False or page_data.rotation_correction != 0:
             return None
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetTextRuleFilter(PipelineStep):
+    """Pipeline step that filters samples based on text content rules.
+
+    Filters out samples that:
+    - Contain markdown tables
+    - Contain malformed HTML tables
+    - Contain math equations that fail to render
+    - Contain mathematical symbols (∈, ∉, ⊂, ⊃, ⊆, ⊇, ∅, ∪, ∩, ∀, ∃, ¬) outside of table cells
+    - Contain LaTeX formatting commands (\\textit, \\textbf, \\texttt, etc.) outside of math equations
+    - Contain LaTeX table environments (\begin{table}, \begin{tabular}, etc.)
+    """
+
+    def _contains_markdown_table(self, text: str) -> bool:
+        """Check if text contains markdown tables."""
+        # Look for pipe-separated table patterns
+        # Markdown tables have lines like: | col1 | col2 | col3 |
+        # And separator lines like: |------|------|------|
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            line = line.strip()
+            # Check if line looks like a table row
+            if line.startswith("|") and line.endswith("|") and line.count("|") >= 3:
+                # Check if next line is a separator (for header rows)
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if next_line.startswith("|") and "-" in next_line:
+                        return True
+                # Check if previous line is a separator (for data rows)
+                if i > 0:
+                    prev_line = lines[i - 1].strip()
+                    if prev_line.startswith("|") and "-" in prev_line:
+                        return True
+        return False
+
+    def _contains_math_symbols(self, text: str) -> bool:
+        """Check if text contains specific mathematical symbols outside of table cells.
+
+        Returns:
+            True if text contains any of the specified math symbols outside tables
+            False otherwise
+        """
+        # List of mathematical symbols to check for
+        math_symbols = [
+            # Set theory and logic
+            "∈",
+            "∉",
+            "⊂",
+            "⊃",
+            "⊆",
+            "⊇",
+            "∅",
+            "∪",
+            "∩",
+            "∀",
+            "∃",
+            "¬",
+            # Common mathematical operators
+            "⊕",
+            "⊗",
+            "⊙",
+            # Calculus and analysis
+            "∂",
+            "∇",
+            "∆",
+            "∫",
+            "∬",
+            "∭",
+            "∮",
+            "∏",
+            "∑",
+            "√",
+            "∛",
+            "∜",
+            # Arrows and relations
+            "⊥",
+            # Other common math symbols
+            "∠",
+            "∡",
+            "⊤",
+            "⊢",
+            "⊣",
+            "∴",
+            "∵",
+            "∶",
+            "∷",
+            "∝",
+            "≅",
+            "≆",
+            "≇",
+            "≊",
+            "≋",
+            # Matrix and vector notation
+            "⊕",
+            "⊖",
+            "⊗",
+            "⊘",
+            "⊙",
+            "⊚",
+            "⊛",
+            "⊜",
+            "⊝",
+        ]
+
+        # First, remove all HTML tables from the text
+        text_without_tables = text
+
+        # Remove HTML tables
+        table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+        text_without_tables = table_pattern.sub("", text_without_tables)
+
+        # Now check if any of these symbols appear in the text without tables
+        for symbol in math_symbols:
+            if symbol in text_without_tables:
+                return True
+
+        return False
+
+    def _contains_latex_tables(self, text: str) -> bool:
+        """Check if text contains LaTeX table environments.
+
+        Returns:
+            True if text contains LaTeX tables (\\begin{table}, \\begin{tabular}, etc.)
+            False otherwise
+        """
+
+        # Check for various LaTeX table environments
+        latex_table_patterns = [
+            r"\\begin\{table\}",
+            r"\\begin\{tabular\}",
+        ]
+
+        # Check if any LaTeX table pattern exists in the text
+        for pattern in latex_table_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+
+        return False
+
+    def _contains_latex_formatting_outside_math(self, text: str) -> bool:
+        """Check if text contains LaTeX formatting commands outside of math equations.
+
+        Returns:
+            True if text contains LaTeX formatting commands outside math equations
+            False otherwise
+        """
+
+        # List of common LaTeX formatting commands to check for
+        latex_commands = [
+            # Lists & basic content
+            r"\begin{itemize}",
+            r"\begin{enumerate}",
+            r"\item",
+            # Figures, tables, and captions
+            r"\begin{figure}",
+            r"\includegraphics",
+            r"\caption",
+            r"\label",
+            r"\ref",
+            r"\eqref",
+            r"\begin{table}",
+            r"\begin{tabular}",
+            # Formatting,
+            r"\textit",
+            r"\textbb",
+            # Math (strong signals)
+            r"\begin{equation}",
+            r"\begin{align}",
+            r"\frac",
+            r"\sum",
+            r"\int",
+            r"\sqrt",
+            r"\prod",
+            r"\lim",
+            r"\binom",
+            r"\mathbb",
+            r"\mathcal",
+            r"\to",
+            r"\varphi",
+            r"\cdot",
+            r"\langle",
+            r"\rangle",
+            # Citations (bibliography stacks)
+            r"\cite",
+        ]
+
+        # First, remove all math equations from the text
+        text_without_math = text
+
+        # Patterns for math equations
+        math_patterns = [
+            r"\$\$(.+?)\$\$",  # $$...$$
+            r"\\\((.+?)\\\)",  # \(...\)
+            r"\\\[(.+?)\\\]",  # \[...\]
+        ]
+
+        # Remove all math equations
+        for pattern in math_patterns:
+            text_without_math = re.sub(pattern, "", text_without_math, flags=re.DOTALL)
+
+        # Check if any LaTeX commands appear in the remaining text
+        for command in latex_commands:
+            if command in text_without_math:
+                return True
+
+        return False
+
+    def _validate_math_equations(self, text: str) -> bool:
+        """Check if all math equations in the text can render without errors.
+
+        Returns:
+            True if all equations render successfully or no equations exist
+            False if any equation fails to render
+        """
+
+        # Patterns to find math equations (same as in MathTest)
+        patterns = [
+            r"\$\$(.+?)\$\$",  # $$...$$
+            r"\\\((.+?)\\\)",  # \(...\)
+            r"\\\[(.+?)\\\]",  # \[...\]
+        ]
+
+        equations = []
+        for pattern in patterns:
+            # Find all matches for the current pattern
+            matches = re.findall(pattern, text, re.DOTALL)
+            equations.extend([eq.strip() for eq in matches])
+
+        # If no equations found, that's fine
+        if not equations:
+            return True
+
+        # Try to render each equation
+        try:
+            from olmocr.bench.katex.render import render_equation
+
+            for equation in equations:
+                # Skip empty or whitespace-only equations
+                if not equation or not equation.strip():
+                    continue
+
+                # Try to render the equation
+                rendered = render_equation(equation)
+
+                # Check if there was an error
+                if rendered is None or (hasattr(rendered, "error") and rendered.error):
+                    # Equation failed to render
+                    logger.warning(f"Could not render equation '{repr(equation)}', skipping sample")
+                    return False
+
+            # All equations rendered successfully
+            return True
+        except Exception as e:
+            # If any unexpected error occurs during validation, be conservative and filter out
+            print(f"Error validating math equations: {e}")
+            return False
+
+    def _contains_br_in_table_cells(self, text: str) -> bool:
+        """Check if text contains <br> tags within HTML table cells.
+
+        Returns:
+            True if any table cell contains <br> tags
+            False otherwise
+        """
+
+        # Check if there are any tables in the text
+        if "<table" not in text.lower() or "<br" not in text.lower():
+            return False  # No tables or no <br> tags at all
+
+        # Pattern to find HTML tables (case-insensitive)
+        table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+        tables = table_pattern.findall(text)
+
+        # Check each table for <br> tags in cells
+        for table_html in tables:
+            # Pattern to find table cells (td and th tags)
+            cell_pattern = re.compile(r"<(td|th)\b[^>]*>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+            cells = cell_pattern.findall(table_html)
+
+            for tag_type, cell_content in cells:
+                # Check if cell content contains <br> tags (any variation)
+                if re.search(r"<br\s*/?>", cell_content, re.IGNORECASE):
+                    return True
+
+        return False
+
+    def _extract_and_validate_html_tables(self, text: str) -> bool:
+        """Extract HTML tables and validate they parse correctly.
+
+        Returns:
+            True if all HTML tables are valid or no tables exist
+            False if any HTML table is malformed
+        """
+        # Find all HTML table blocks
+
+        # Check if there are any <table> tags at all
+        if "<table" not in text.lower():
+            return True  # No tables, that's fine
+
+        # Pattern to find HTML tables (case-insensitive)
+        # Note: This pattern might not catch malformed tables where </table> is missing
+        table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+        tables = table_pattern.findall(text)
+
+        # Also check for unclosed table tags
+        table_open_count = len(re.findall(r"<table\b[^>]*>", text, re.IGNORECASE))
+        table_close_count = len(re.findall(r"</table>", text, re.IGNORECASE))
+
+        if table_open_count != table_close_count:
+            return False  # Mismatched table tags
+
+        if not tables and table_open_count > 0:
+            # Found table tags but couldn't extract complete tables
+            return False
+
+        # Try to parse each table
+
+        class TableValidator(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.tag_stack = []
+                self.is_valid = True
+                self.error_msg = None
+
+            def handle_starttag(self, tag, attrs):
+                self.tag_stack.append(tag.lower())
+
+            def handle_endtag(self, tag):
+                tag = tag.lower()
+                if not self.tag_stack:
+                    self.is_valid = False
+                    self.error_msg = f"Unexpected closing tag: {tag}"
+                    return
+
+                # Check if the closing tag matches the most recent opening tag
+                if self.tag_stack[-1] == tag:
+                    self.tag_stack.pop()
+                else:
+                    # For HTML, some tags can be implicitly closed (like td, tr)
+                    # But we should still detect truly malformed tables
+                    if tag in self.tag_stack:
+                        # Pop until we find the matching tag
+                        while self.tag_stack and self.tag_stack[-1] != tag:
+                            self.tag_stack.pop()
+                        if self.tag_stack:
+                            self.tag_stack.pop()
+                    else:
+                        self.is_valid = False
+                        self.error_msg = f"Mismatched tag: expected {self.tag_stack[-1]}, got {tag}"
+
+            def error(self, message):
+                self.is_valid = False
+                self.error_msg = message
+
+        # Validate each table
+        for table_html in tables:
+            parser = TableValidator()
+            try:
+                parser.feed(table_html)
+                # Check if all tags were closed
+                if parser.tag_stack:
+                    return False  # Unclosed tags
+                if not parser.is_valid:
+                    return False  # Parser found an error
+            except Exception:
+                # Any parsing exception means the table is malformed
+                return False
+
+        return True
+
+    def __call__(self, sample: Sample) -> Optional[Sample]:
+        """Filter samples based on text content rules."""
+        # Get the natural text from page_data if it exists
+        text = None
+
+        if "page_data" in sample:
+            page_data = sample["page_data"]
+            if hasattr(page_data, "natural_text") and page_data.natural_text:
+                text = page_data.natural_text
+
+        # If no text to check, pass the sample through
+        if text is None:
+            return sample
+
+        # Check for markdown tables
+        if self._contains_markdown_table(text):
+            return None  # Filter out samples with markdown tables
+
+        # Check for HTML tables and validate them
+        if not self._extract_and_validate_html_tables(text):
+            return None  # Filter out samples with malformed HTML tables
+
+        # We had a check for <br> tags in table cells
+        # Note, this was maybe removing too much stuff
+
+        # Check if all math equations can render without errors
+        if not self._validate_math_equations(text):
+            return None  # Filter out samples with invalid math equations
+
+        # Check for mathematical symbols
+        if self._contains_math_symbols(text):
+            return None  # Filter out samples with mathematical symbols
+
+        # Check for LaTeX formatting outside math equations
+        if self._contains_latex_formatting_outside_math(text):
+            return None  # Filter out samples with \textit or \textbf outside math
+
+        # Check for LaTeX tables
+        if self._contains_latex_tables(text):
+            return None  # Filter out samples with LaTeX tables
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class ReformatLatexBoldItalic(PipelineStep):
+    """Pipeline step that converts LaTeX formatting commands to markdown equivalents.
+
+    Converts:
+    - \\textit{...} to *...* (italic)
+    - \\textbf{...} to **...** (bold)
+
+    These conversions only happen outside of math equations.
+    """
+
+    def __call__(self, sample: Sample) -> Optional[Sample]:
+        """Convert LaTeX formatting to markdown in the sample text."""
+        # Get the natural text from page_data if it exists
+        if "page_data" not in sample:
+            return sample
+
+        page_data = sample["page_data"]
+        if not hasattr(page_data, "natural_text") or not page_data.natural_text:
+            return sample
+
+        text = page_data.natural_text
+
+        # Math equation patterns to preserve
+        math_patterns = [
+            r"\$\$(.+?)\$\$",  # $$...$$
+            r"\\\((.+?)\\\)",  # \(...\)
+            r"\\\[(.+?)\\\]",  # \[...\]
+        ]
+
+        # Store math equations with placeholders
+        math_placeholders = []
+        preserved_text = text
+
+        # Replace math equations with placeholders
+        for i, pattern in enumerate(math_patterns):
+            matches = re.finditer(pattern, preserved_text, re.DOTALL)
+            for j, match in enumerate(matches):
+                placeholder = f"__MATH_PLACEHOLDER_{i}_{j}__"
+                math_placeholders.append((placeholder, match.group(0)))
+                preserved_text = preserved_text.replace(match.group(0), placeholder, 1)
+
+        # Now convert LaTeX formatting to markdown
+        # We need to handle nested braces properly
+        # Use a function to find matching braces
+        def replace_latex_command(text, command, markdown):
+            """Replace LaTeX command with markdown, handling nested braces."""
+            pattern = r"\\" + command + r"\{"
+            result = []
+            i = 0
+
+            while i < len(text):
+                match = re.search(pattern, text[i:])
+                if not match:
+                    result.append(text[i:])
+                    break
+
+                # Add text before the match
+                result.append(text[i : i + match.start()])
+
+                # Find the matching closing brace
+                start_pos = i + match.end()
+                brace_count = 1
+                j = start_pos
+
+                while j < len(text) and brace_count > 0:
+                    if text[j] == "{":
+                        brace_count += 1
+                    elif text[j] == "}":
+                        brace_count -= 1
+                    j += 1
+
+                if brace_count == 0:
+                    # Extract the content between braces
+                    content = text[start_pos : j - 1]
+                    result.append(markdown + content + markdown)
+                    i = j
+                else:
+                    # Unmatched braces, keep original
+                    result.append(text[i + match.start() : i + match.end()])
+                    i = i + match.end()
+
+            return "".join(result)
+
+        # Handle \textbf{...} -> **...**
+        preserved_text = replace_latex_command(preserved_text, "textbf", "**")
+
+        # Handle \textit{...} -> *...*
+        preserved_text = replace_latex_command(preserved_text, "textit", "*")
+
+        # Restore math equations
+        for placeholder, original in math_placeholders:
+            preserved_text = preserved_text.replace(placeholder, original)
+
+        # Create a new PageResponse with the updated text (since it's frozen)
+
+        updated_page_data = replace(page_data, natural_text=preserved_text)
+        sample["page_data"] = updated_page_data
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class TableTransformation(PipelineStep):
+    """Pipeline step that applies transformations to HTML tables in the natural text.
+
+    Supported transformations:
+    - "annotate_dims": Adds data-totalrows and data-totalcols attributes to each table
+      showing the total number of rows and columns.
+    - "firstrowpreview": Adds an HTML comment after the opening <table> tag showing
+      a preview of the first row that has the maximum number of columns.
+    """
+
+    transformation: str = "annotate_dims"  # The transformation to apply
+
+    def _firstrowpreview(self, text: str) -> str:
+        """Add an HTML comment showing a preview of the first data row."""
+        from olmocr.bench.table_parsing import parse_html_tables
+
+        # Find all HTML tables
+        table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+        tables = table_pattern.findall(text)
+
+        if not tables:
+            return text
+
+        result = text
+        for table_html in tables:
+            # Parse the table to get its structure
+            parsed_tables = parse_html_tables(table_html)
+
+            if not parsed_tables:
+                continue
+
+            table_data = parsed_tables[0]
+
+            if not table_data.cell_text:
+                continue
+
+            # Get max columns
+            max_col = max(col for _, col in table_data.cell_text.keys()) + 1
+
+            # Group cells by row
+            rows_data: dict[int, dict[int, str]] = {}
+            for (row, col), cell_text in table_data.cell_text.items():
+                if row not in rows_data:
+                    rows_data[row] = {}
+                rows_data[row][col] = cell_text
+
+            # Find first row with max_col columns
+            preview_row_idx = None
+            preview_row_data = None
+            for row_idx in sorted(rows_data.keys()):
+                if len(rows_data[row_idx]) == max_col:
+                    preview_row_idx = row_idx
+                    preview_row_data = rows_data[row_idx]
+                    break
+
+            if preview_row_idx is None or preview_row_data is None:
+                continue
+
+            # Build the comment string
+            col_descriptions = []
+            for col_idx in sorted(preview_row_data.keys()):
+                cell_value = preview_row_data[col_idx].strip()
+                # Truncate long values
+                if len(cell_value) > 50:
+                    cell_value = cell_value[:47] + "..."
+                col_descriptions.append(f"Column {col_idx + 1}: {cell_value}")
+
+            comment = f"<!-- Sample row ({preview_row_idx + 1}): {', '.join(col_descriptions)} -->"
+
+            # Insert the comment after the opening <table> tag
+            table_open_match = re.match(r"<table\b[^>]*>", table_html, re.IGNORECASE)
+            if table_open_match:
+                table_open_tag = table_open_match.group(0)
+                new_table_html = table_html.replace(table_open_tag, table_open_tag + comment, 1)
+                result = result.replace(table_html, new_table_html, 1)
+
+        return result
+
+    def _annotate_dims(self, text: str) -> str:
+        """Add data-totalrows and data-totalcols attributes to HTML tables."""
+        from olmocr.bench.table_parsing import parse_html_tables
+
+        # Find all HTML tables
+        table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+        tables = table_pattern.findall(text)
+
+        if not tables:
+            return text
+
+        result = text
+        for table_html in tables:
+            # Parse the table to get its structure
+            parsed_tables = parse_html_tables(table_html)
+
+            if not parsed_tables:
+                continue
+
+            table_data = parsed_tables[0]
+
+            # Get the max row and col from cell_text keys
+            if not table_data.cell_text:
+                continue
+
+            max_row = max(row for row, col in table_data.cell_text.keys()) + 1
+            max_col = max(col for row, col in table_data.cell_text.keys()) + 1
+
+            # Find the opening <table> tag and add the attributes
+            table_open_match = re.match(r"<table\b([^>]*)>", table_html, re.IGNORECASE)
+            if table_open_match:
+                existing_attrs = table_open_match.group(1)
+                new_attrs = f' data-totalrows="{max_row}" data-totalcols="{max_col}"'
+
+                # Check if attributes already exist
+                if "data-totalrows" not in existing_attrs.lower():
+                    new_table_open = f"<table{existing_attrs}{new_attrs}>"
+                    new_table_html = table_html.replace(table_open_match.group(0), new_table_open, 1)
+                    result = result.replace(table_html, new_table_html, 1)
+
+        return result
+
+    def __call__(self, sample: Sample) -> Optional[Sample]:
+        """Apply the specified transformation to HTML tables in the sample text."""
+        # Get the natural text from page_data if it exists
+        if "page_data" not in sample:
+            return sample
+
+        page_data = sample["page_data"]
+        if not hasattr(page_data, "natural_text") or not page_data.natural_text:
+            return sample
+
+        text = page_data.natural_text
+
+        # Apply the specified transformation
+        if self.transformation == "annotate_dims":
+            text = self._annotate_dims(text)
+        elif self.transformation == "firstrowpreview":
+            text = self._firstrowpreview(text)
+        else:
+            raise ValueError(f"Unknown table transformation: {self.transformation}")
+
+        # Create a new PageResponse with the updated text (since it's frozen)
+        updated_page_data = replace(page_data, natural_text=text)
+        sample["page_data"] = updated_page_data
 
         return sample
 
@@ -660,8 +1219,8 @@ class Tokenizer(PipelineStep):
 
     def __call__(self, sample: Sample) -> Sample:
         """Tokenize messages and create labels for training."""
-        if np is None:
-            raise ImportError("numpy is required for Tokenizer step")
+        if torch is None:
+            raise ImportError("torch is required for Tokenizer step")
 
         # Extract user message and response
         user_messages = sample["user_messages"]
@@ -684,33 +1243,33 @@ class Tokenizer(PipelineStep):
             text=[text],
             images=[main_image],
             padding=True,
-            return_tensors="np",
+            return_tensors="pt",
         )
 
         # Get labels by tokenizing the output text
-        labels = self.processor(text=[response], padding=True, return_tensors="np")
+        labels = self.processor(text=[response], padding=True, return_tensors="pt")
 
         # Append end-of-message token to the labels
         end_tokens = self.processor.tokenizer(self.end_of_message_token, add_special_tokens=False)["input_ids"]
-        end_tokens = np.array(end_tokens, dtype=inputs.input_ids.dtype)
+        end_tokens = torch.tensor(end_tokens, dtype=inputs.input_ids.dtype)
 
         # Handle the case where labels['input_ids'] is empty
         if labels["input_ids"].shape[1] == 0:
-            labels_input_ids_0 = np.array([], dtype=inputs.input_ids.dtype)
+            labels_input_ids_0 = torch.tensor([], dtype=inputs.input_ids.dtype)
         else:
-            labels_input_ids_0 = labels["input_ids"][0].astype(inputs.input_ids.dtype)
+            labels_input_ids_0 = labels["input_ids"][0].to(inputs.input_ids.dtype)
 
-        labels["input_ids"] = np.concatenate([labels_input_ids_0, end_tokens])
-        labels["input_ids"] = np.expand_dims(labels["input_ids"], axis=0)
+        labels["input_ids"] = torch.cat([labels_input_ids_0, end_tokens])
+        labels["input_ids"] = labels["input_ids"].unsqueeze(0)
 
         # Concatenate input_ids and labels
-        input_ids = np.concatenate([inputs.input_ids[0], labels.input_ids[0]], axis=0)
+        input_ids = torch.cat([inputs.input_ids[0], labels.input_ids[0]], dim=0)
 
         # All columns will participate in attention fully
-        attention_mask = np.ones_like(input_ids)
+        attention_mask = torch.ones_like(input_ids)
 
         # Create labels, masking the input portion with -100
-        labels_full = np.full_like(input_ids, fill_value=self.masking_index)
+        labels_full = torch.full_like(input_ids, fill_value=self.masking_index)
         labels_full[len(inputs.input_ids[0]) :] = labels.input_ids[0]
 
         # Return as dict, including pixel_values
@@ -738,25 +1297,25 @@ class RandomTokenFlipper(PipelineStep):
         if "labels" not in sample or "input_ids" not in sample:
             return sample
 
-        # Work with copies to avoid modifying original arrays
-        labels = sample["labels"].copy()
-        input_ids = sample["input_ids"].copy()
+        # Work with clones to avoid modifying original tensors
+        labels = sample["labels"].clone() if torch.is_tensor(sample["labels"]) else torch.tensor(sample["labels"])
+        input_ids = sample["input_ids"].clone() if torch.is_tensor(sample["input_ids"]) else torch.tensor(sample["input_ids"])
 
         # Find indices where labels are not masked (i.e., output tokens)
-        non_masked_indices = np.where(labels != self.masking_index)[0]
+        non_masked_indices = torch.where(labels != self.masking_index)[0]
 
         if len(non_masked_indices) == 0:
             return sample
 
         # For each non-masked token, independently decide whether to flip
         for idx in non_masked_indices:
-            if np.random.random() < self.token_flip_rate:
+            if torch.rand(1).item() < self.token_flip_rate:
                 # Pick a random token from the valid tokens list
-                random_token = np.random.choice(self.valid_token_ids)
+                random_token = self.valid_token_ids[torch.randint(len(self.valid_token_ids), (1,)).item()]
                 input_ids[idx] = random_token
                 labels[idx] = self.masking_index
 
-        # Update sample with modified arrays
+        # Update sample with modified tensors
         sample["input_ids"] = input_ids
         sample["labels"] = labels
 
@@ -823,6 +1382,12 @@ if __name__ == "__main__":
         help="Index of sample to display in detail",
     )
     parser.add_argument(
+        "--sample-md",
+        type=str,
+        default=None,
+        help="Substring of markdown path to search for and display",
+    )
+    parser.add_argument(
         "--analyze-tokens",
         action="store_true",
         help="Analyze token length distribution across entire dataset",
@@ -831,6 +1396,11 @@ if __name__ == "__main__":
         "--save-image",
         type=str,
         help="Save the processed image to the specified file path (e.g., output.png)",
+    )
+    parser.add_argument(
+        "--save-filtered",
+        type=str,
+        help="Directory to save .md and .pdf files of filtered samples (samples that return None from pipeline)",
     )
 
     args = parser.parse_args()
@@ -880,6 +1450,100 @@ if __name__ == "__main__":
 
     print(f"Dataset length: {len(dataset)}")
 
+    # Handle --save-filtered option
+    if args.save_filtered:
+        import shutil
+        from pathlib import Path
+
+        save_dir = Path(args.save_filtered)
+
+        # Clear and create directory
+        if save_dir.exists():
+            shutil.rmtree(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n=== Checking for filtered samples ===")
+        print(f"Will save filtered samples to: {save_dir}")
+
+        # Function to process and copy a single sample
+        def process_and_copy_sample(idx, dataset_samples, save_dir_str):
+            """Process a sample and return info if it's filtered.
+
+            Note: This function needs to be picklable for ProcessPoolExecutor,
+            so it takes simple arguments rather than complex objects.
+            """
+            import shutil
+            from pathlib import Path
+
+            # Recreate dataset with same parameters
+            # This is needed because dataset objects can't be pickled
+            temp_dataset = BaseMarkdownPDFDataset.__new__(BaseMarkdownPDFDataset)
+            temp_dataset.samples = dataset_samples
+            temp_dataset.pipeline_steps = pipeline_steps
+
+            try:
+                sample = temp_dataset[idx]
+                if sample is None:
+                    # This sample was filtered out - get the original paths
+                    original_sample = dataset_samples[idx]
+                    md_path = original_sample["markdown_path"]
+                    pdf_path = original_sample["pdf_path"]
+
+                    save_dir = Path(save_dir_str)
+
+                    # Create subdirectory to preserve some structure
+                    # Use the parent directory name and file name
+                    rel_path = md_path.parent.name
+                    target_subdir = save_dir / rel_path
+                    target_subdir.mkdir(parents=True, exist_ok=True)
+
+                    # Copy markdown file
+                    target_md = target_subdir / md_path.name
+                    shutil.copy2(md_path, target_md)
+
+                    # Copy PDF file
+                    target_pdf = target_subdir / pdf_path.name
+                    shutil.copy2(pdf_path, target_pdf)
+
+                    return {"index": idx, "markdown_path": str(md_path), "pdf_path": str(pdf_path)}
+                return None
+            except Exception as e:
+                print(f"Error processing sample {idx}: {e}")
+                return None
+
+        # Process all samples in parallel
+        filtered_samples = []
+        print(f"Processing {len(dataset)} samples to find and copy filtered ones...")
+
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            # Submit all tasks
+            futures = {executor.submit(process_and_copy_sample, idx, dataset.samples, str(save_dir)): idx for idx in range(len(dataset))}
+
+            # Process results with progress bar
+            with tqdm(total=len(dataset), desc="Processing samples") as pbar:
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        filtered_samples.append(result)
+                    pbar.update(1)
+
+        # Sort filtered samples by index for consistent output
+        filtered_samples.sort(key=lambda x: x["index"])
+
+        print(f"\nFound and copied {len(filtered_samples)} filtered samples to: {save_dir}")
+
+        if filtered_samples:
+            print(f"First 10 filtered samples:")
+            for i, sample_info in enumerate(filtered_samples[:10]):
+                md_name = Path(sample_info["markdown_path"]).name
+                print(f"  Sample {sample_info['index']}: {md_name}")
+            if len(filtered_samples) > 10:
+                print(f"  ... and {len(filtered_samples) - 10} more")
+
+        # Exit early if --save-filtered is used (don't continue with other analyses)
+        print("\nCompleted saving filtered samples. Exiting.")
+        exit(0)
+
     if len(dataset) > 0:
         # Show first few samples
         print("\nFirst 5 samples:")
@@ -887,23 +1551,48 @@ if __name__ == "__main__":
             sample = dataset.samples[i]
             print(f"  {i}: MD: {sample['markdown_path'].name}, PDF: {sample['pdf_path'].name}")
 
+        # Determine which sample to display
+        sample_idx = args.sample_index
+
+        # If --sample-md is provided, search for matching sample
+        if args.sample_md:
+            matching_indices = []
+            for i, s in enumerate(dataset.samples):
+                if args.sample_md in str(s["markdown_path"]):
+                    matching_indices.append(i)
+
+            if len(matching_indices) == 0:
+                print(f"\nError: No samples found containing '{args.sample_md}' in markdown path.")
+                exit(1)
+            elif len(matching_indices) > 1:
+                print(f"\nError: Multiple samples found containing '{args.sample_md}':")
+                for idx in matching_indices[:10]:  # Show first 10 matches
+                    print(f"  {idx}: {dataset.samples[idx]['markdown_path']}")
+                if len(matching_indices) > 10:
+                    print(f"  ... and {len(matching_indices) - 10} more")
+                print("\nPlease use a more specific substring.")
+                exit(1)
+            else:
+                sample_idx = matching_indices[0]
+                print(f"\nFound sample at index {sample_idx}: {dataset.samples[sample_idx]['markdown_path']}")
+
         # Check if sample index is valid
-        if args.sample_index >= len(dataset):
-            print(f"\nError: Sample index {args.sample_index} out of range. Only {len(dataset)} samples available.")
+        if sample_idx >= len(dataset):
+            print(f"\nError: Sample index {sample_idx} out of range. Only {len(dataset)} samples available.")
             exit(1)
 
         # Get the requested sample
-        print(f"\n=== Displaying sample {args.sample_index} ===")
-        sample = dataset[args.sample_index]
+        print(f"\n=== Displaying sample {sample_idx} ===")
+        sample = dataset[sample_idx]
 
         # Display sample information based on pipeline output
         print("\nSample keys:", list(sample.keys()))
 
         # If it's raw data (no tokenization)
         if "markdown_path" in sample:
-            print(f"\nMarkdown file: {sample['markdown_path'].name}")
+            print(f"\nMarkdown file: {sample['markdown_path']}")
         if "pdf_path" in sample:
-            print(f"PDF file: {sample['pdf_path'].name}")
+            print(f"PDF file: {sample['pdf_path']}")
         if "image" in sample and hasattr(sample["image"], "size"):
             print(f"Image size: {sample['image'].size}")
 
@@ -937,16 +1626,23 @@ if __name__ == "__main__":
             # Show label masking
             print(f"\nLabel masking analysis:")
             labels = sample["labels"]
-            masked_count = np.sum(labels == -100)
-            total_count = len(labels)
+            # Handle both numpy arrays and torch tensors
+            if torch.is_tensor(labels):
+                masked_count = (labels == -100).sum().item()
+                total_count = labels.numel()
+                labels_array = labels.cpu().numpy() if labels.is_cuda else labels.numpy()
+            else:
+                masked_count = np.sum(labels == -100)
+                total_count = len(labels)
+                labels_array = labels
             print(f"  Total tokens: {total_count}")
             print(f"  Masked tokens: {masked_count} ({masked_count/total_count*100:.1f}%)")
             print(f"  Unmasked tokens: {total_count - masked_count} ({(total_count - masked_count)/total_count*100:.1f}%)")
 
             # Find the transition point
             transition_idx = None
-            for i in range(len(labels) - 1):
-                if labels[i] == -100 and labels[i + 1] != -100:
+            for i in range(len(labels_array) - 1):
+                if labels_array[i] == -100 and labels_array[i + 1] != -100:
                     transition_idx = i + 1
                     break
 
@@ -955,15 +1651,21 @@ if __name__ == "__main__":
 
             # Print all tokens
             input_ids = sample["input_ids"]
-            print(f"\nAll tokens ({len(input_ids)} total):")
+            # Handle both numpy arrays and torch tensors
+            if torch.is_tensor(input_ids):
+                input_ids_array = input_ids.cpu().numpy() if input_ids.is_cuda else input_ids.numpy()
+            else:
+                input_ids_array = input_ids
+
+            print(f"\nAll tokens ({len(input_ids_array)} total):")
             print("Format: [index] Token (repr) | Label | Token ID")
             print("-" * 80)
 
-            for i in range(len(input_ids)):
-                token = processor.tokenizer.decode([input_ids[i]])
+            for i in range(len(input_ids_array)):
+                token = processor.tokenizer.decode([int(input_ids_array[i])])
                 token_repr = repr(token)
-                label = labels[i] if i < len(labels) else "N/A"
-                token_id = input_ids[i]
+                label = labels_array[i] if i < len(labels_array) else "N/A"
+                token_id = int(input_ids_array[i])
 
                 # Mark special positions
                 marker = ""
@@ -971,7 +1673,7 @@ if __name__ == "__main__":
                     marker = " <-- TRANSITION (first unmasked)"
                 elif i == 0:
                     marker = " <-- START"
-                elif label != -100 and i > 0 and labels[i - 1] == -100:
+                elif label != -100 and i > 0 and labels_array[i - 1] == -100:
                     marker = " <-- response begins"
 
                 print(f"[{i:4d}] {token_repr:20s} | {str(label):6s} | {token_id:6d}{marker}")
@@ -982,7 +1684,7 @@ if __name__ == "__main__":
             # Count consecutive high-value tokens that represent the image
             # Qwen uses tokens like 151859, 151860, etc. for image patches
             image_token_threshold = 151000  # Typical threshold for Qwen image tokens
-            image_token_count = np.sum(input_ids > image_token_threshold)
+            image_token_count = np.sum(input_ids_array > image_token_threshold)
 
             # Calculate prompt tokens (everything masked)
             prompt_token_count = masked_count
@@ -1004,50 +1706,34 @@ if __name__ == "__main__":
             print(f"\n\n=== Analyzing token length distribution across entire dataset ===")
             print(f"Processing {len(dataset)} samples...")
 
-            # Function to process a single sample
-            def process_sample(idx):
-                try:
-                    current_sample = dataset[idx]
-                    if "labels" in current_sample:
-                        # Count total sequence length (all tokens, prompt + completion)
-                        labels = current_sample["labels"]
-                        total_length = len(labels)
-                        return (idx, total_length, None)
-                    return (idx, None, "No labels in sample")
-                except Exception as e:
-                    return (idx, None, str(e))
-
-            # Process samples in parallel with progress bar
+            # Process samples sequentially with progress bar
+            # (ProcessPoolExecutor doesn't work well here because the dataset
+            # and pipeline steps can't be easily pickled for multiprocessing)
             sequence_lengths = []
             max_sequence_length = 0
             max_sequence_sample_idx = 0
             errors = []
 
-            # Determine number of workers (use fewer workers to avoid memory issues)
-            import multiprocessing
-
-            num_workers = min(multiprocessing.cpu_count() // 2, 8)
-
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all tasks
-                futures = {executor.submit(process_sample, idx): idx for idx in range(len(dataset))}
-
-                # Process results with progress bar
-                with tqdm(total=len(dataset), desc="Analyzing samples") as pbar:
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        try:
-                            idx, sequence_length, error = future.result()
-                            if error:
-                                errors.append((idx, error))
-                            elif sequence_length is not None:
-                                sequence_lengths.append(sequence_length)
-                                if sequence_length > max_sequence_length:
-                                    max_sequence_length = sequence_length
-                                    max_sequence_sample_idx = idx
-                        except Exception as e:
-                            errors.append((idx, f"Future error: {e}"))
-                        pbar.update(1)
+            for idx in tqdm(range(len(dataset)), desc="Analyzing samples"):
+                try:
+                    current_sample = dataset[idx]
+                    if current_sample is None:
+                        continue
+                    if "labels" in current_sample:
+                        # Count total sequence length (all tokens, prompt + completion)
+                        labels = current_sample["labels"]
+                        if torch.is_tensor(labels):
+                            total_length = labels.numel()
+                        else:
+                            total_length = len(labels)
+                        sequence_lengths.append(total_length)
+                        if total_length > max_sequence_length:
+                            max_sequence_length = total_length
+                            max_sequence_sample_idx = idx
+                    else:
+                        errors.append((idx, "No labels in sample"))
+                except Exception as e:
+                    errors.append((idx, str(e)))
 
             if errors:
                 print(f"\nEncountered {len(errors)} errors during processing")

@@ -30,16 +30,13 @@ dependencies = [
   "ftfy",
   "bleach",
   "markdown2",
+  "markdownify",
   "filelock",
   "orjson",
   "requests",
   "zstandard",
   "boto3",
   "httpx",
-  "torch>=2.7.0",
-  "transformers==4.53.2",
-  "img2pdf",
-  "beaker-py",
 ]
 license = {file = "LICENSE"}
 
@@ -49,9 +46,18 @@ Repository = "https://github.com/allenai/olmocr"
 Changelog = "https://github.com/allenai/olmocr/blob/main/CHANGELOG.md"
 # Documentation = "https://olmocr.readthedocs.io/"
 
+[project.scripts]
+olmocr = "olmocr.pipeline:cli_main"
+
 [project.optional-dependencies]
 gpu = [
-    "vllm==0.10.0"
+    "torch>=2.7.0",
+    "transformers==4.57.3",
+    "vllm==0.11.2"
+]
+
+beaker = [
+    "beaker-py",
 ]
 
 dev = [
@@ -79,6 +85,8 @@ dev = [
     "datasets",
     "omegaconf",
     "spacy",
+    "wandb",
+    "trl",
 ]
 
 bench = [
@@ -89,16 +97,19 @@ bench = [
     "syntok",
     "openai",
     "google-genai",
+    "anthropic",
     "playwright",
     "mistralai",
     "lxml",
     "flask",
+    "wordfreq",
 ]
 
 train = [
     "torch",
     "torchvision",
     "accelerate",
+    "trl",
     "peft",
     "wandb",
     "omegaconf",
@@ -192,3 +203,4 @@ log_level = "DEBUG"
 markers = [
     "nonci: mark test as not intended for CI runs"
 ]
+addopts = "-m 'not nonci'"

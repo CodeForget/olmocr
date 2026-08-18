@@ -20,6 +20,7 @@ from transformers import (
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
     Qwen2VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     get_scheduler,
 )
 
@@ -34,6 +35,46 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def prepare_lora_model(model: torch.nn.Module, model_cfg) -> torch.nn.Module:
+    """Wrap the model with a LoRA adapter according to the configuration."""
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise ImportError("LoRA training requires the `peft` package. Install it with `pip install peft`.") from exc
+
+    lora_kwargs = dict(
+        r=model_cfg.lora_rank,
+        lora_alpha=model_cfg.lora_alpha,
+        lora_dropout=model_cfg.lora_dropout,
+        target_modules=model_cfg.lora_target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    if model_cfg.lora_modules_to_save:
+        lora_kwargs["modules_to_save"] = model_cfg.lora_modules_to_save
+
+    lora_config = LoraConfig(**lora_kwargs)
+    model = get_peft_model(model, lora_config)
+
+    if hasattr(model, "config"):
+        model.config.base_model_name_or_path = model_cfg.name
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None:
+        inner_model = getattr(base_model, "model", None)
+        if inner_model is not None and hasattr(inner_model, "config"):
+            inner_model.config._name_or_path = model_cfg.name
+
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+
+    return model
+
+
+def is_lora_checkpoint(checkpoint_dir: str) -> bool:
+    """Detect whether a checkpoint directory contains LoRA adapter weights."""
+    return os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json"))
 
 
 class QwenDataCollator:
@@ -140,9 +181,29 @@ def load_checkpoint(
     lr_scheduler: Any,
     checkpoint_dir: str,
     device: torch.device,
+    *,
+    base_model_path: Optional[str] = None,
+    use_lora: bool = False,
 ) -> tuple[torch.nn.Module, Dict[str, Any]]:
     """Load model, optimizer, scheduler, and training state from checkpoint."""
-    model = model_class.from_pretrained(checkpoint_dir, **init_kwargs)
+    checkpoint_has_lora = is_lora_checkpoint(checkpoint_dir)
+
+    if checkpoint_has_lora or use_lora:
+        if base_model_path is None:
+            raise ValueError("base_model_path must be provided when loading LoRA checkpoints.")
+
+        try:
+            from peft import PeftModel
+        except ImportError as exc:  # pragma: no cover - optional dependency guard
+            raise ImportError("Loading a LoRA checkpoint requires the `peft` package. Install it with `pip install peft`.") from exc
+
+        base_model = model_class.from_pretrained(base_model_path, **init_kwargs)
+        model = PeftModel.from_pretrained(base_model, checkpoint_dir, is_trainable=True)
+        if hasattr(model, "config"):
+            model.config.base_model_name_or_path = base_model_path
+    else:
+        model = model_class.from_pretrained(checkpoint_dir, **init_kwargs)
+
     model.to(device)
 
     optimizer.load_state_dict(torch.load(os.path.join(checkpoint_dir, "optimizer.pt"), map_location=device))
@@ -189,6 +250,46 @@ def evaluate_model(
     return eval_metrics
 
 
+def create_train_dataloader(
+    train_dataset,
+    config,
+    data_collator,
+    seed_worker,
+    epoch_num: int = 0,
+) -> DataLoader:
+    """Create a training dataloader with epoch-specific shuffling.
+
+    Args:
+        train_dataset: The training dataset
+        config: Training configuration
+        data_collator: Data collator for batching
+        seed_worker: Worker initialization function
+        epoch_num: Current epoch number for seed generation
+
+    Returns:
+        DataLoader with epoch-specific shuffling
+    """
+    # Create generator with epoch-specific seed for different shuffling each epoch
+    epoch_generator = torch.Generator()
+    if config.training.data_seed is not None:
+        # Use epoch number to ensure different shuffling each epoch while maintaining reproducibility
+        epoch_generator.manual_seed(config.training.data_seed + epoch_num)
+    else:
+        # Use a random seed if no data_seed specified
+        epoch_generator.manual_seed(int(torch.randint(0, 2**32 - 1, (1,)).item()))
+
+    return DataLoader(
+        train_dataset,
+        batch_size=config.training.per_device_train_batch_size,
+        shuffle=True,
+        collate_fn=data_collator,
+        num_workers=config.training.dataloader_num_workers,
+        drop_last=config.training.dataloader_drop_last,
+        worker_init_fn=seed_worker,
+        generator=epoch_generator,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train OlmOCR model")
     parser.add_argument("--config", type=str, default="olmocr/train/configs/example_config.yaml", help="Path to YAML configuration file")
@@ -231,14 +332,26 @@ def main():
 
     # Load model
     logger.info(f"Loading model: {config.model.name}")
-    if "Qwen2.5-VL" in config.model.name:
+    if "qwen3-vl" in config.model.name.lower():
+        model_class = Qwen3VLForConditionalGeneration
+        model = model_class.from_pretrained(config.model.name, **model_init_kwargs)
+    elif "qwen2.5-vl" in config.model.name.lower() or "olmocr-2-7b-1025" in config.model.name.lower():
         model_class = Qwen2_5_VLForConditionalGeneration
         model = model_class.from_pretrained(config.model.name, **model_init_kwargs)
-    elif "Qwen2-VL" in config.model.name:
+    elif "qwen2-vl" in config.model.name.lower():
         model_class = Qwen2VLForConditionalGeneration
         model = model_class.from_pretrained(config.model.name, **model_init_kwargs)
     else:
         raise NotImplementedError()
+
+    if config.model.use_lora:
+        logger.info("Applying LoRA adapters as specified in the config.")
+        model = prepare_lora_model(model, config.model)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_ratio = (trainable_params / total_params * 100) if total_params else 0.0
+    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_ratio:.2f}%)")
 
     # Enable gradient checkpointing if configured
     if config.training.gradient_checkpointing:
@@ -313,12 +426,6 @@ def main():
 
         random.seed(worker_seed)
 
-    # Create generator for data loader
-    generator = None
-    if config.training.data_seed is not None:
-        generator = torch.Generator()
-        generator.manual_seed(config.training.data_seed)
-
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -336,15 +443,19 @@ def main():
         logger.info("Model compilation complete")
 
     # Set up optimizer
+    trainable_named_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if not trainable_named_params:
+        raise ValueError("No trainable parameters found. Check model fine-tuning configuration.")
+
     if config.training.optim == "adamw_torch":
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
-                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "params": [p for n, p in trainable_named_params if not any(nd in n for nd in no_decay)],
                 "weight_decay": config.training.weight_decay,
             },
             {
-                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "params": [p for n, p in trainable_named_params if any(nd in n for nd in no_decay)],
                 "weight_decay": 0.0,
             },
         ]
@@ -355,11 +466,14 @@ def main():
             eps=float(config.training.adam_epsilon),
         )
     elif config.training.optim == "muon":
+        if config.model.use_lora:
+            raise NotImplementedError("LoRA training is not currently supported with the Muon optimizer in this loop.")
+
         # Separate parameters for Muon (hidden matrices) and Adam (embeddings, scalars, head)
-        hidden_matrix_params = [p for n, p in model.named_parameters() if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
-        embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-        scalar_params = [p for p in model.parameters() if p.ndim < 2]
-        head_params = [p for n, p in model.named_parameters() if "lm_head" in n]
+        hidden_matrix_params = [p for n, p in trainable_named_params if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+        embed_params = [p for n, p in trainable_named_params if "embed" in n]
+        scalar_params = [p for n, p in trainable_named_params if p.ndim < 2]
+        head_params = [p for n, p in trainable_named_params if "lm_head" in n]
 
         # Create Adam groups with different learning rates
         adam_groups = [
@@ -413,21 +527,28 @@ def main():
     best_metric = float("inf") if not config.training.greater_is_better else -float("inf")
 
     if found_resumable_checkpoint:
-        model, state = load_checkpoint(model_class, model_init_kwargs, optimizer, lr_scheduler, found_resumable_checkpoint, device)
+        model, state = load_checkpoint(
+            model_class,
+            model_init_kwargs,
+            optimizer,
+            lr_scheduler,
+            found_resumable_checkpoint,
+            device,
+            base_model_path=config.model.name,
+            use_lora=config.model.use_lora,
+        )
         global_step = state["global_step"]
         best_metric = state["best_metric"]
         samples_seen = state["samples_seen"]
 
-    # Create dataloaders
-    train_dataloader = DataLoader(
+    # Create dataloaders - use epoch 0 initially (will be recreated with proper epoch if resuming)
+    current_epoch_num = int(samples_seen / len(train_dataset)) if samples_seen > 0 else 0
+    train_dataloader = create_train_dataloader(
         train_dataset,
-        batch_size=config.training.per_device_train_batch_size,
-        shuffle=True,
-        collate_fn=data_collator,
-        num_workers=config.training.dataloader_num_workers,
-        drop_last=config.training.dataloader_drop_last,
-        worker_init_fn=seed_worker,
-        generator=generator,
+        config,
+        data_collator,
+        seed_worker,
+        epoch_num=current_epoch_num,
     )
 
     eval_dataloaders = {
@@ -467,11 +588,23 @@ def main():
             samples_to_skip = samples_seen % len(train_dataset)
             batches_to_skip = samples_to_skip // config.training.per_device_train_batch_size
             logger.info(f"Resuming training: skipping {batches_to_skip} batches ({samples_to_skip} samples) to reach position {samples_seen}")
+
+            # Skip batches to resume from the correct position within the epoch
             for _ in range(batches_to_skip):
                 try:
                     next(epoch_iterator)
                 except StopIteration:
-                    # We've reached the end of the epoch while skipping, create new iterator
+                    # We've reached the end of the epoch while skipping
+                    # This shouldn't normally happen, but handle it gracefully
+                    logger.warning(f"Reached end of epoch while skipping batches. Creating new epoch.")
+                    current_epoch_num += 1
+                    train_dataloader = create_train_dataloader(
+                        train_dataset,
+                        config,
+                        data_collator,
+                        seed_worker,
+                        epoch_num=current_epoch_num,
+                    )
                     epoch_iterator = iter(train_dataloader)
                     break
 
@@ -482,9 +615,21 @@ def main():
             try:
                 batch = next(epoch_iterator)
             except StopIteration:
-                # End of epoch, create new iterator
+                # End of epoch, create new dataloader with fresh shuffle
                 current_epoch = samples_seen / len(train_dataset)
                 logger.info(f"Completed epoch {current_epoch:.2f}")
+
+                # Increment epoch number for new shuffle seed
+                current_epoch_num += 1
+
+                # Recreate dataloader with new generator for fresh shuffle
+                train_dataloader = create_train_dataloader(
+                    train_dataset,
+                    config,
+                    data_collator,
+                    seed_worker,
+                    epoch_num=current_epoch_num,
+                )
                 epoch_iterator = iter(train_dataloader)
                 batch = next(epoch_iterator)
 
